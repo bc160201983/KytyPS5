@@ -410,6 +410,13 @@ private:
 #endif
 };
 
+// Preserve exact names; fold ASCII only for compatibility with Windows dumps.
+std::string FoldMemberCase(std::string_view name) {
+    std::string folded(name);
+    for (auto& c: folded) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    return folded;
+}
+
 class PkgArchiveBackend final: public ArchiveReader {
 public:
 	explicit PkgArchiveBackend(const std::filesystem::path& package,
@@ -436,6 +443,8 @@ public:
 			if (kind > 1 || !entries_.emplace(name, Entry {id, size, kind == 1}).second)
 				throw std::runtime_error("Duplicate/invalid catalog entry");
             catalog_index_.push_back(Entry {id, size, kind == 1});
+            auto [alias, inserted] = folded_names_.emplace(FoldMemberCase(name), name);
+            if (!inserted) alias->second.reset(); // Never guess between case collisions.
 		}
 		auto root = entries_.find("");
 		if (root == entries_.end() || root->second.is_file)
@@ -457,11 +466,11 @@ public:
 		             entries_.size());
 	}
 	std::optional<Entry> Find(std::string_view member) override {
-		auto found = entries_.find(std::string(member));
+		auto found = entries_.find(ResolveMember(member));
 		return found == entries_.end() ? std::nullopt : std::optional<Entry>(found->second);
 	}
 	std::vector<File::DirEntry> List(std::string_view member) override {
-		auto found = children_.find(std::string(member));
+		auto found = children_.find(ResolveMember(member));
 		return found == children_.end() ? std::vector<File::DirEntry> {} : found->second;
 	}
 	uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) override {
@@ -499,6 +508,14 @@ public:
 	}
 
 private:
+    std::string ResolveMember(std::string_view member) const {
+        std::string exact(member);
+        if (entries_.contains(exact)) return exact;
+        const auto alias = folded_names_.find(FoldMemberCase(member));
+        if (alias != folded_names_.end() && alias->second) return *alias->second;
+        return exact;
+    }
+    std::unordered_map<std::string, std::optional<std::string>> folded_names_;
 	std::vector<Entry> catalog_index_;
 	std::chrono::milliseconds                                    read_timeout_;
 	bool                                                         failed_ = false;

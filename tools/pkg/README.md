@@ -141,3 +141,14 @@ Regression check (requires the real helper):
 ```sh
 python tools/pkg/tests/run_compare_test.py _Build/windows/launcher/pkg_compare_folder.exe
 ```
+
+## Filename compatibility
+
+PKG lookups preserve exact catalog names and prefer exact matches. If no exact
+match exists, an unambiguous ASCII case-insensitive match is accepted for both
+files and directories. This supports games requesting names such as
+`Il2CppUserAssemblies.prx` when their dump contains `Il2cppUserAssemblies.prx`,
+as on a normal Windows extracted-folder installation. Case-colliding entries
+remain accessible by their exact names; ambiguous aliases are not selected.
+This compatibility fallback is consistent across host platforms and does not
+perform Unicode case folding.

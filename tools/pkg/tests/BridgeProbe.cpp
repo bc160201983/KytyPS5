@@ -15,6 +15,12 @@ int main(int argc, char** argv) {
     assert(boot && file && boot->is_file && file->size > (1ULL << 32));
     assert(reader->Find("sce_sys/param.json"));
     assert(!reader->Find("not-present"));
+    auto mixed = reader->Find("DaTa/SpArSe.BIN");
+    assert(mixed && mixed->id == file->id && mixed->size == file->size);
+    assert(reader->Find("EBOOT.BIN")->id == boot->id);
+    assert(reader->Find("SCE_SYS/PARAM.JSON"));
+    assert(reader->List("DaTa").size() == 1);
+    assert(reader->List("DaTa")[0].name == "sparse.bin");
     assert(!reader->Find("data")->is_file);
     assert(reader->List("data").size() == 1);
     std::array<uint8_t, 32> bytes {};

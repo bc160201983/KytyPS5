@@ -29,6 +29,18 @@ static int Helper(const std::string& mode) {
         while (std::cin.get(byte)) std::cout.put(byte).flush();
         return 0;
     }
+    if (mode == "case-catalog") {
+        const char header[] = {'K','P','K','1',4,0,0,0};
+        std::cout.write(header, sizeof(header));
+        const char root[13] = {};
+        std::cout.write(root, sizeof(root));
+        for (const char name: {'x', 'X', 'y'}) {
+            const char file[] = {2,0,0,0,name,'a',0,0,0,0,0,0,0,0,1};
+            std::cout.write(file, sizeof(file));
+        }
+        std::cout.flush();
+        return 0;
+    }
     if (mode == "partial") std::cout.write("KP", 2).flush();
     if (mode == "catalog" || mode == "healthy" || mode == "readstall" || mode == "readpartial") {
         const char header[] = {'K','P','K','1',static_cast<char>(mode == "catalog" ? 1 : 2),0,0,0};
@@ -54,6 +66,14 @@ static int Helper(const std::string& mode) {
 int main(int argc, char** argv) {
     if (argc == 3) return Helper(argv[2]);
     try {
+        {
+            Common::PkgArchiveBackend reader("case-catalog", 2s);
+            Check(reader.Find("xa")->id == 1, "exact lowercase collision lost");
+            Check(reader.Find("Xa")->id == 2, "exact uppercase collision lost");
+            Check(reader.Find("YA")->id == 3, "case fallback missing");
+            Check(!reader.Find("XA"), "ambiguous alias unexpectedly resolved");
+            Check(!reader.Find("z"), "missing name unexpectedly found");
+        }
         for (const auto* mode : {"silent", "partial", "catalog"}) {
             const auto start = std::chrono::steady_clock::now();
             bool timed_out = false;
