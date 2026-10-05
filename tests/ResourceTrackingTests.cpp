@@ -496,6 +496,26 @@ void CheckIndexedMaterialImageTable(bool guarded_load, bool formatted = false, b
   memory.fail_address = 0x3004;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "unreadable material keys were silently accepted");
+  memory.fail_address = UINT64_MAX;
+  constexpr uint32_t records = 2u * 1024u * 1024u + 1u;
+  user_data[6] = records;
+  memory.words.resize((0x2000u + records * 16u) / 4u);
+  std::fill(memory.words.begin() + 0x2000u / 4u, memory.words.end(), 0u);
+  memory.words[0x2004u / 4u] = 1u;
+  memory.words[(0x2004u + (records - 1u) * 16u) / 4u] = 127u;
+  memory.reads = 0;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+        snapshot.images.size() == 4 && snapshot.images[3].dwords[0] == 0x1000,
+        "large material grid lost the last record or exceeded the old per-record limit");
+  Check(memory.reads < 600u, "large material grid was read one record at a time");
+  memory.fail_address = 0x3004u + (records - 1u) * 16u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable final material block was silently accepted");
+  memory.fail_address = UINT64_MAX;
+  user_data[6] = (64u * 1024u * 1024u) / 16u + 1u;
+  memory.reads = 0;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 0u,
+        "oversized material descriptor was scanned without a byte bound");
 }
 
 void TestIndexedMaterialImageTable() {

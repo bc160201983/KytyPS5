@@ -19,6 +19,11 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+// Bound material-grid scans by bytes, independently of descriptor-heap probes.
+// Read in blocks so a multi-million-record grid does not cause millions of callbacks.
+constexpr uint64_t MaxMaterialScanBytes = 64u * 1024u * 1024u;
+constexpr uint64_t MaterialReadBytes = 64u * 1024u;
+
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
 
@@ -275,7 +280,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 				    "GPU-selected image table has {} records; limit is {}", count, MaxIndirectImageProbes));
 			if (indirect.indexed_material_keys) {
 				ShaderBufferResource material;
-				if (!DecodeBufferDescriptor(material_value, material) || material.Stride() == 0u ||
+				if (!DecodeBufferDescriptor(material_value, material) || material.Stride() == 0u || (material.Stride() & 3u) != 0u ||
 				    (material.PackedStride() & (1u << 14u)) != 0u ||
 				    indirect.selector_offset + uint64_t{4} > material.Stride())
 					return SpecializationFail("unsupported indexed material buffer geometry");
@@ -293,22 +298,37 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 						if (info.packed_bitfield || info.component_bits[source.component] != 32u)
 							return SpecializationFail("material key component is not a raw 32-bit value");
 						field_offset += Format::GetFormatComponentByteOffset(info, source.component);
-
 					} else {
 						return SpecializationFail("unsupported material key swizzle");
 					}
 				}
-				const auto records = material.GetSize() / material.Stride();
-				if (records > MaxIndirectImageProbes)
-					return SpecializationFail("indexed material buffer exceeds probe limit");
+				const auto records = material.NumRecords();
+				if (material.GetSize() > MaxMaterialScanBytes)
+					return SpecializationFail(fmt::format(
+					    "material scan exceeds {} bytes: base=0x{:x} records={} stride={} bytes={}",
+					    MaxMaterialScanBytes, material.Base48(), records, material.Stride(), material.GetSize()));
 				// An out-of-range indexed load yields zero, so retain key zero too.
 				keys.push_back(0u);
-				for (uint64_t record = 0; record < records; ++record) {
-					uint32_t packed = 0;
+				std::vector<uint8_t> seen(static_cast<size_t>(count), 0u);
+				if (!seen.empty()) seen[0] = 1u;
+				const uint64_t records_per_read = std::max<uint64_t>(1u, MaterialReadBytes / material.Stride());
+				std::vector<uint32_t> words;
+				for (uint64_t first = 0; first < records; first += records_per_read) {
+					const auto batch = std::min<uint64_t>(records - first, records_per_read);
+					// Read from the first selected field through the last, excluding
+					// the final record's unused tail and respecting descriptor bounds.
+					const auto bytes = (batch - 1u) * material.Stride() + sizeof(uint32_t);
+					words.resize(static_cast<size_t>(bytes / sizeof(uint32_t)));
 					if (!ReadScalarTable(material.Base48(), material.GetSize(),
-					    record * material.Stride() + field_offset, runtime, {&packed, 1})) return false;
-					const auto key = packed & indirect.material_key_mask;
-					if (key < count) keys.push_back(key); // Missing keys retain the null fallback.
+					    first * material.Stride() + field_offset, runtime, words)) return false;
+					for (uint64_t record = 0; record < batch; ++record) {
+						const auto key = words[record * (material.Stride() / sizeof(uint32_t))] &
+						    indirect.material_key_mask;
+						if (key < count && !seen[key]) {
+							seen[key] = 1u;
+							keys.push_back(key);
+						}
+					}
 				}
 				std::ranges::sort(keys);
 				keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
