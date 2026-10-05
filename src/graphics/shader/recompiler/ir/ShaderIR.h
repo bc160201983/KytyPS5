@@ -478,6 +478,7 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		bool     bounded_buffer_table = false;
 		Value    key_count;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;

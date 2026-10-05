@@ -290,6 +290,82 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
   return fixture;
 }
 
+void TestGpuSelectedSharedImageTable() {
+  Fixture fixture;
+  const auto table = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                    fixture.UserData(2), fixture.UserData(3)});
+  const auto lane_key = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {lane_key, Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  std::array<Value, 8> words;
+  for (uint32_t i = 0; i < 8; ++i) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.offset = i * 4;
+    words[i] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                           fixture.AddMemory(memory, 0x113c));
+  }
+  for (unsigned i = 0; i < 2; ++i) {
+    const auto image = fixture.Image(words, 0x114c + i * 8);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x114c + i * 8));
+  }
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+  Check(fixture.program.info.images.size() == 1, "shared image table was not interned");
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, 64u, 0u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  std::copy(descriptor.begin(), descriptor.end(), memory.words.begin());
+  descriptor[0] = 0x40u;
+  std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 8);
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "GPU-selected buffer table did not materialize");
+  Check(snapshot.images.size() == 3 && snapshot.images[0].dwords[0] == 0 &&
+        snapshot.images[1].dwords[0] == 0x20 && snapshot.images[2].dwords[0] == 0x40,
+        "image table lost descriptors or its out-of-bounds null fallback");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 2 &&
+        snapshot.flattened_srt[mapping + 1] == 0 && snapshot.flattened_srt[mapping + 2] == 1 &&
+        snapshot.flattened_srt[mapping + 3] == 1 && snapshot.flattened_srt[mapping + 4] == 2,
+        "GPU keys were not mapped to their correct texture ordinals");
+  user_data[2] = 32;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2,
+        "one-entry heap lost its null fallback");
+  user_data[2] = 48;
+  memory.fail_address = 0x1030;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "partial last descriptor read beyond the buffer instead of zeroing its tail");
+  user_data[2] = 64;
+  memory.fail_address = 0x1020;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable in-bounds descriptor was silently accepted");
+  memory.fail_address = UINT64_MAX;
+  user_data[2] = 32u * 65537u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "oversized descriptor heap bypassed the probe limit");
+  user_data[2] = 0;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+        snapshot.images.size() == 1 && snapshot.images[0].dwords[0] == 0,
+        "empty descriptor heap did not produce a null resource");
+}
+
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
@@ -3466,6 +3542,7 @@ int main() {
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
+    Run("GPU-selected shared image table", TestGpuSelectedSharedImageTable);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

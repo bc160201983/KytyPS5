@@ -252,7 +252,17 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		} else {
 			return false;
 		}
-		if (indirect.material_source == UINT32_MAX) {
+		if (indirect.bounded_buffer_table) {
+			if (table_value.dword_count != 4u || indirect.material_source != UINT32_MAX ||
+			    indirect.table_offset != 0u || table_size > (uint64_t{1} << 32u)) return false;
+			// Include a partial final record: scalar-buffer reads zero its tail.
+			const auto count = (table_size + 31u) / 32u;
+			if (count > MaxIndirectImageProbes)
+				return SpecializationFail(fmt::format(
+				    "GPU-selected image table has {} records; limit is {}", count, MaxIndirectImageProbes));
+			keys.resize(static_cast<size_t>(count));
+			std::iota(keys.begin(), keys.end(), 0u);
+		} else if (indirect.material_source == UINT32_MAX) {
 			uint32_t key_count = 0;
 			const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
 			if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
@@ -321,6 +331,12 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	const auto children_begin = snapshot.images.size();
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto root_image = specialization.images[image_index];
+	if (indirect.bounded_buffer_table) {
+		// Ordinal zero is the fallback for keys outside the buffer. Do not let
+		// the binary-search miss path silently sample the first valid texture.
+		snapshot.images[image_index].dwords.fill(0);
+		snapshot.images[image_index].dword_count = 8u;
+	}
 	const auto key_count = sources.empty() ? keys.size() : sources.size();
 	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
@@ -341,7 +357,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			candidate.dwords.fill(0);
 		}
 		uint32_t ordinal = 0;
-		if (entry == 0) {
+		if (entry == 0 && !indirect.bounded_buffer_table) {
 			snapshot.images[image_index] = candidate;
 		} else if (snapshot.images[image_index] != candidate) {
 			const auto found = std::find(snapshot.images.begin() + children_begin,
@@ -507,7 +523,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
 		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
 		                           : 0u;
-		if (root.indirect_search_iterations == 0u || key_count < 2u ||
+		if (root.indirect_search_iterations == 0u || key_count == 0u ||
 		    static_cast<size_t>(root.indirect_mapping_offset) + 1u +
 		            static_cast<size_t>(key_count) * 2u >
 		        snapshot.flattened_srt.size()) {

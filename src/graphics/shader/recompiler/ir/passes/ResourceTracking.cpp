@@ -314,7 +314,16 @@ public:
 			}
 		}
 		for (const auto& plan: m_indirect_images) {
-			plan.handle->SetArg(0, plan.key);
+			auto key = plan.key;
+			if (m_sources[plan.source].indirect_image->bounded_buffer_table) {
+				// The original U32 key << 5 discards its top five bits.
+				auto* block = plan.handle->Parent();
+				const auto where = std::ranges::find_if(block->Instructions(),
+				    [&](const Inst& inst) { return &inst == plan.handle; });
+				key = Value(&*block->PrependNewInst(where, ValueOpcode::BitwiseAnd32,
+				    {key, Value(0x07ffffffu)}));
+			}
+			plan.handle->SetArg(0, key);
 			for (uint32_t dword = 0; dword < 4u; dword++) {
 				plan.handle->SetArg(dword + 1u, plan.roots[dword + 4u]);
 			}
@@ -764,6 +773,7 @@ private:
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
 				    a.table_offset != b.table_offset || a.sources != b.sources ||
+				    a.bounded_buffer_table != b.bounded_buffer_table ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -1357,7 +1367,7 @@ private:
 		return {};
 	}
 
-	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan) {
+	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan, bool bounded_table = false) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
@@ -1398,8 +1408,19 @@ private:
 				return false;
 			}
 			table_handle = current_handle;
-			const std::array<const Inst*, 1> image_users {&handle};
-			if (!UsesOnly(*read, image_users)) {
+			// One descriptor load can feed several samples (for example two LODs).
+			// Every consumer must use the same complete descriptor, so all reads
+			// can be made planning-only together without dropping a live use.
+			const bool image_uses = !read->Uses().empty() &&
+			    std::ranges::all_of(read->Uses(), [&](const Use& use) {
+				    const auto* other = use.user;
+				    if (other->GetOpcode() != ValueOpcode::GetImageResource ||
+				        other->NumArgs() != 8u || other->Parent() != handle.Parent()) return false;
+				    for (uint32_t word = 0; word < 8u; ++word)
+					    if (other->Arg(word).Resolve() != handle.Arg(word).Resolve()) return false;
+				    return true;
+			    });
+			if (!image_uses) {
 				return false;
 			}
 			plan.memory[dword] = memory_index;
@@ -1413,7 +1434,19 @@ private:
 		DescriptorSource material_source;
 		DescriptorSource::IndirectImage indirect;
 		indirect.table_offset = table_offset;
-		if (table_source.dword_count == 2u) {
+		if (bounded_table) {
+			// GPU-selected keys need not be host-evaluable. A scalar buffer gives
+			// an explicit byte bound for enumerating its 32-byte image records.
+			if (table_source.dword_count != 4u || table_offset != 0u) return false;
+			const auto* selector = key.Resolve().TryInstruction();
+			if (selector == nullptr || selector->GetOpcode() != ValueOpcode::ReadFirstLane ||
+			    selector->NumArgs() != 2u) return false;
+			if (std::ranges::any_of(handle.Uses(), [](const Use& use) {
+				return use.user->GetOpcode() != ValueOpcode::ImageSampleRaw &&
+				       use.user->GetOpcode() != ValueOpcode::ImageGatherRaw;
+			})) return false;
+			indirect.bounded_buffer_table = true;
+		} else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
@@ -1650,7 +1683,8 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, plan) || TryMakeFiniteImage(*handle, plan)) {
+				if (TryMakeIndirectImage(*handle, plan) || TryMakeFiniteImage(*handle, plan) ||
+				    TryMakeIndirectImage(*handle, plan, true)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
