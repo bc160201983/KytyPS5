@@ -366,6 +366,145 @@ void TestGpuSelectedSharedImageTable() {
         "empty descriptor heap did not produce a null resource");
 }
 
+void CheckIndexedMaterialImageTable(bool guarded_load, bool formatted = false, bool unsafe_arm = false) {
+  Fixture fixture;
+  const auto table = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                    fixture.UserData(2), fixture.UserData(3)});
+  const auto lane_key = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto material = fixture.Buffer({fixture.UserData(4), fixture.UserData(5),
+                                       fixture.UserData(6), fixture.UserData(7)});
+  MemoryInfo load_info;
+  load_info.kind = ResourceKind::Buffer;
+  load_info.idxen = true;
+  load_info.offset = formatted ? 0u : 4u;
+  load_info.formatted = formatted;
+  load_info.data_bits = 32;
+  load_info.data_dwords = formatted ? 2u : 1u;
+  auto packed = fixture.Emit(formatted ? ValueOpcode::LoadBufferU32x2 : ValueOpcode::LoadBufferU32,
+      {material, lane_key, Value(0u), Value(0u), Value(guarded_load)}, fixture.AddMemory(load_info, 0x1100));
+  if (formatted) {
+    packed = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {packed, Value(1u)});
+    const auto condition = fixture.Emit(ValueOpcode::IEqual32, {lane_key, Value(0u)});
+    const auto temporary = fixture.Emit(ValueOpcode::IAdd32, {lane_key, Value(7u)});
+    // When the outer condition is false, the temporary in the inner true arm
+    // cannot reach the sampled key. A different outer condition is unsafe.
+    const auto stale = fixture.Emit(ValueOpcode::SelectU32, {condition, temporary, Value(0u)});
+    const auto outer = unsafe_arm
+        ? fixture.Emit(ValueOpcode::IEqual32, {lane_key, Value(1u)}) : condition;
+    const auto selected = fixture.Emit(ValueOpcode::SelectU32, {outer, packed, stale});
+    auto* entry = fixture.block;
+    auto* left = fixture.AddBlock();
+    auto* right = fixture.AddBlock();
+    auto* merge = fixture.AddBlock();
+    entry->AddBranch(left); entry->AddBranch(right);
+    left->AddBranch(merge); right->AddBranch(merge);
+    namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+    fixture.program.block_info[0].condition = condition;
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+    fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 3};
+    fixture.program.block_info[2].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 3};
+    fixture.program.block_info[3].terminator = {.kind = CFG::TerminatorKind::Return};
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(left, selected);
+    phi.AddPhiOperand(right, Value(0u));
+    fixture.block = merge;
+    packed = Value(&phi);
+  }
+  const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32, {packed, Value(0xfffffu)});
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {masked, Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  std::array<Value, 8> words;
+  for (uint32_t i = 0; i < 8; ++i) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.offset = i * 4;
+    words[i] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                           fixture.AddMemory(memory, 0x113c));
+  }
+  for (unsigned i = 0; i < 2; ++i) {
+    const auto image = fixture.Image(words, 0x114c + i * 8);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x114c + i * 8));
+  }
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+  Check(fixture.program.info.images.size() == 1, "shared image table was not interned");
+  std::array<uint32_t, 8> user_data{0x1000u, 0u, 128u * 32u, 0u, 0x3000u, 16u << 16u, 3u, 0u};
+  const auto identity_swizzle = Libs::Graphics::DstSel(4, 5, 6, 7);
+  if (formatted)
+    user_data[7] = (static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32UInt) << 12u) |
+        identity_swizzle;
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t i = 0; i < 128; ++i) {
+    descriptor[0] = 0x20u + i * 0x20u;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + i * 8);
+  }
+  memory.words[0x2004 / 4] = 0x80000001u;
+  memory.words[0x2014 / 4] = 127u;
+  memory.words[0x2024 / 4] = 1u;
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  if (!guarded_load || unsafe_arm) {
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "unproven material load incorrectly narrowed an oversized heap");
+    return;
+  }
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "GPU-selected buffer table did not materialize");
+  Check(snapshot.images.size() == 4 && snapshot.images[0].dwords[0] == 0 &&
+        snapshot.images[1].dwords[0] == 0x20 && snapshot.images[2].dwords[0] == 0x40 &&
+        snapshot.images[3].dwords[0] == 0x1000,
+        "material key narrowing lost selected images or retained unused heap entries");
+  Check(plan.capture_specialization_reads && !snapshot.specialization_reads.empty(),
+        "material keys were not captured for specialization invalidation");
+  memory.words[0x2014 / 4] = 2u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+        snapshot.images.size() == 4 && snapshot.images[3].dwords[0] == 0x60,
+        "changed material keys did not update the image mapping");
+  if (formatted) {
+    // A changed runtime swizzle must read X, not reuse the previous Y field.
+    memory.words[0x2000 / 4] = 3u;
+    memory.words[0x2010 / 4] = 3u;
+    memory.words[0x2020 / 4] = 3u;
+    const auto original = user_data[7];
+    user_data[7] = (original & ~0xfffu) | Libs::Graphics::DstSel(4, 4, 6, 7);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+          snapshot.images.size() == 3 && snapshot.images[2].dwords[0] == 0x80,
+          "formatted material swizzle was ignored");
+    user_data[7] = (static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k16_16UNorm) << 12u) |
+        identity_swizzle;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "normalized material values were treated as raw texture keys");
+    user_data[7] = original;
+  }
+  memory.fail_address = 0x3004;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable material keys were silently accepted");
+}
+
+void TestIndexedMaterialImageTable() {
+  CheckIndexedMaterialImageTable(true);
+  CheckIndexedMaterialImageTable(false);
+  CheckIndexedMaterialImageTable(true, true);
+  CheckIndexedMaterialImageTable(true, true, true);
+}
+
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
@@ -3543,6 +3682,7 @@ int main() {
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("GPU-selected shared image table", TestGpuSelectedSharedImageTable);
+    Run("indexed material image table", TestIndexedMaterialImageTable);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

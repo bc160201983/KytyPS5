@@ -262,7 +262,8 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			return false;
 		}
 		if (indirect.bounded_buffer_table) {
-			if (table_value.dword_count != 4u || indirect.material_source != UINT32_MAX ||
+			if (table_value.dword_count != 4u ||
+			    (!indirect.indexed_material_keys && indirect.material_source != UINT32_MAX) ||
 			    indirect.table_offset != 0u || table_size > (uint64_t{1} << 32u))
 				return SpecializationFail(fmt::format(
 				    "image {} invalid bounded table: width={} base=0x{:x} size=0x{:x}",
@@ -272,8 +273,49 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			if (count > MaxIndirectImageProbes)
 				return SpecializationFail(fmt::format(
 				    "GPU-selected image table has {} records; limit is {}", count, MaxIndirectImageProbes));
-			keys.resize(static_cast<size_t>(count));
-			std::iota(keys.begin(), keys.end(), 0u);
+			if (indirect.indexed_material_keys) {
+				ShaderBufferResource material;
+				if (!DecodeBufferDescriptor(material_value, material) || material.Stride() == 0u ||
+				    (material.PackedStride() & (1u << 14u)) != 0u ||
+				    indirect.selector_offset + uint64_t{4} > material.Stride())
+					return SpecializationFail("unsupported indexed material buffer geometry");
+				uint64_t field_offset = indirect.selector_offset;
+				if (indirect.material_component != UINT32_MAX) {
+					const auto info = Format::GetFormatInfo(material.Format());
+					if (indirect.material_component >= 4u ||
+					    (info.type != Format::ComponentType::Uint && info.type != Format::ComponentType::Sint &&
+					     info.type != Format::ComponentType::Float) ||
+					    info.byte_size + field_offset > material.Stride())
+						return SpecializationFail("unsupported formatted material key");
+					const auto selector = GetDstSel(material.DstSelXYZW(), indirect.material_component);
+					const auto source = Format::ResolveFormattedSource(info, selector);
+					if (source.kind == Format::FormattedSourceKind::Memory) {
+						if (info.packed_bitfield || info.component_bits[source.component] != 32u)
+							return SpecializationFail("material key component is not a raw 32-bit value");
+						field_offset += Format::GetFormatComponentByteOffset(info, source.component);
+
+					} else {
+						return SpecializationFail("unsupported material key swizzle");
+					}
+				}
+				const auto records = material.GetSize() / material.Stride();
+				if (records > MaxIndirectImageProbes)
+					return SpecializationFail("indexed material buffer exceeds probe limit");
+				// An out-of-range indexed load yields zero, so retain key zero too.
+				keys.push_back(0u);
+				for (uint64_t record = 0; record < records; ++record) {
+					uint32_t packed = 0;
+					if (!ReadScalarTable(material.Base48(), material.GetSize(),
+					    record * material.Stride() + field_offset, runtime, {&packed, 1})) return false;
+					const auto key = packed & indirect.material_key_mask;
+					if (key < count) keys.push_back(key); // Missing keys retain the null fallback.
+				}
+				std::ranges::sort(keys);
+				keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+			} else {
+				keys.resize(static_cast<size_t>(count));
+				std::iota(keys.begin(), keys.end(), 0u);
+			}
 		} else if (indirect.material_source == UINT32_MAX) {
 			uint32_t key_count = 0;
 			const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
@@ -946,7 +988,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			continue;
 		}
 		plan.requires_specialization_memory = true;
-		capture_image_reads |= !source->indirect_image->selector_mask.IsEmpty() ||
+		capture_image_reads |= source->indirect_image->indexed_material_keys ||
+		                       !source->indirect_image->selector_mask.IsEmpty() ||
 		                       !source->indirect_image->sources.empty();
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->material_source),
 		                   plan.clean_flat_slots, source->indirect_image->selector_mask);

@@ -774,6 +774,8 @@ private:
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
 				    a.table_offset != b.table_offset || a.sources != b.sources ||
 				    a.bounded_buffer_table != b.bounded_buffer_table ||
+				    a.indexed_material_keys != b.indexed_material_keys || a.material_key_mask != b.material_key_mask ||
+				    a.material_component != b.material_component ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -1042,6 +1044,16 @@ private:
 		guard = SimplifyGuard(guard);
 		required = required.Resolve();
 		if (EquivalentValue(m_program, guard, required)) return true;
+		const auto* a = guard.TryInstruction();
+		const auto* b = required.TryInstruction();
+		if (a && b && a->GetOpcode() == ValueOpcode::Phi && b->GetOpcode() == ValueOpcode::Phi &&
+			a->Parent() == b->Parent() && a->NumArgs() != 0u && a->NumArgs() == b->NumArgs() &&
+			a->NumPhiBlocks() == a->NumArgs() && b->NumPhiBlocks() == b->NumArgs()) {
+			bool same = true;
+			for (size_t i = 0; i < a->NumArgs(); ++i)
+				same &= a->PhiBlock(i) == b->PhiBlock(i) && a->Arg(i).Resolve() == b->Arg(i).Resolve();
+			if (same) return true;
+		}
 		const auto* inst = guard.TryInstruction();
 		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
 		       (Implies(inst->Arg(0), required) || Implies(inst->Arg(1), required));
@@ -1367,6 +1379,191 @@ private:
 		return {};
 	}
 
+	bool MatchIndexedMaterialKey(Value key, const Inst& image, DescriptorSource::IndirectImage& indirect,
+	                             DescriptorSource& material_source) {
+		const auto* first = key.Resolve().TryInstruction();
+		if (first == nullptr || first->GetOpcode() != ValueOpcode::ReadFirstLane ||
+		    first->NumArgs() != 2u) return false;
+		auto guard = first->Arg(1).Resolve();
+		// Empty EXEC may select an undefined lane. Permit that only when every
+		// sampled component is discarded under that same EXEC mask.
+		const bool masked_samples = !image.Uses().empty() && std::ranges::all_of(image.Uses(), [&](const Use& use) {
+			const auto* sample = use.user;
+			if (sample->GetOpcode() != ValueOpcode::ImageSampleRaw || sample->Uses().empty()) return false;
+			return std::ranges::all_of(sample->Uses(), [&](const Use& component_use) {
+				const auto* component = component_use.user;
+				if (component->GetOpcode() != ValueOpcode::CompositeExtractU32x4 || component->Uses().empty()) return false;
+				return std::ranges::all_of(component->Uses(), [&](const Use& select_use) {
+					const auto* select = select_use.user;
+					return select->GetOpcode() == ValueOpcode::SelectU32 &&
+					    select->Arg(1).Resolve().TryInstruction() == component && Implies(select->Arg(0), guard);
+				});
+			});
+		});
+		if (!(guard.IsImmediate() && guard.GetType() == Type::U1 && guard.U1()) &&
+		    !HasActiveLane(guard, first->Parent()) && !masked_samples) return false;
+		const auto* phi = guard.TryInstruction();
+		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi && phi->NumArgs() == 2u) {
+			for (uint32_t initial = 0; initial < 2u; ++initial) {
+				if (Implies(phi->Arg(initial ^ 1u), guard)) {
+					guard = phi->Arg(initial).Resolve();
+					break;
+				}
+			}
+		}
+		// Merge nodes may select among material records. Prove every possible
+		// leaf has the same buffer, field and mask; never follow only one phi arm.
+		std::vector<std::pair<Value, bool>> assumptions;
+		std::vector<Value> active;
+		std::vector<std::pair<Value, bool>> requirements;
+		struct ProvenValue {
+			Value value;
+			uint32_t mask;
+			std::vector<std::pair<Value, bool>> requirements;
+		};
+		std::vector<ProvenValue> proven;
+		uint32_t remaining = 4096u;
+		const auto known = [&](auto&& self, Value condition, uint32_t depth) -> std::optional<bool> {
+			condition = condition.Resolve();
+			if (condition.IsImmediate() && condition.GetType() == Type::U1) return condition.U1();
+			for (const auto& [predicate, positive] : assumptions)
+				if (condition == predicate) {
+					requirements.emplace_back(predicate, positive);
+					return positive;
+				}
+			if (Implies(guard, condition)) return true;
+			if (depth == 0u) return std::nullopt;
+			const auto* inst = condition.TryInstruction();
+			if (inst == nullptr) return std::nullopt;
+			if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+				const auto value = self(self, inst->Arg(0), depth - 1u);
+				if (value) return !*value;
+			}
+			if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				const auto left = self(self, inst->Arg(0), depth - 1u);
+				const auto right = self(self, inst->Arg(1), depth - 1u);
+				if ((left && !*left) || (right && !*right)) return false;
+				if (left && right) return *left && *right;
+			}
+			return std::nullopt;
+		};
+		bool found_load = false;
+		uint32_t field = 0;
+		uint32_t field_mask = 0;
+		uint32_t formatted_component = UINT32_MAX;
+		const auto trace = [&](auto&& self, Value value, uint32_t mask) -> bool {
+			value = value.Resolve();
+			uint32_t immediate;
+			if (ImmediateU32(value, immediate)) return (immediate & mask) == 0u;
+			for (const auto& cached : proven) {
+				if (cached.value != value || cached.mask != mask) continue;
+				if (std::ranges::all_of(cached.requirements, [&](const auto& fact) {
+					return std::ranges::find(assumptions, fact) != assumptions.end();
+				})) {
+					requirements.insert(requirements.end(), cached.requirements.begin(), cached.requirements.end());
+					return true;
+				}
+			}
+			const auto requirement_start = requirements.size();
+			const auto evaluate = [&]() -> bool {
+				if (remaining == 0u || active.size() >= 256u ||
+				    std::ranges::find(active, value) != active.end()) return false;
+				--remaining;
+				active.push_back(value);
+				struct PopActive {
+					std::vector<Value>& values;
+					~PopActive() { values.pop_back(); }
+				} pop {active};
+				const auto* inst = value.TryInstruction();
+				if (inst == nullptr) return false;
+				if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
+					const auto condition = inst->Arg(0).Resolve();
+					if (const auto selected = known(known, condition, 16u))
+						return self(self, inst->Arg(*selected ? 1u : 2u), mask);
+					assumptions.emplace_back(condition, true);
+					const auto branch_start = requirements.size();
+					const bool yes = self(self, inst->Arg(1), mask);
+					assumptions.back().second = false;
+					const bool no = yes && self(self, inst->Arg(2), mask);
+					assumptions.pop_back();
+					// Both arms have been proved, so the branch's own condition is
+					// not a precondition of the merged value.
+					requirements.erase(std::remove_if(requirements.begin() + branch_start, requirements.end(),
+						[&](const auto& fact) { return fact.first == condition; }), requirements.end());
+					return yes && no;
+				}
+				if (inst->GetOpcode() == ValueOpcode::Phi) {
+					if (inst->NumArgs() == 0u) return false;
+					for (size_t arm = 0; arm < inst->NumArgs(); ++arm)
+						if (!self(self, inst->Arg(arm), mask)) return false;
+					return true;
+				}
+				if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && inst->NumArgs() == 2u) {
+					uint32_t bits;
+					if (ImmediateU32(inst->Arg(0), bits)) return self(self, inst->Arg(1), mask & bits);
+					if (ImmediateU32(inst->Arg(1), bits)) return self(self, inst->Arg(0), mask & bits);
+					return false;
+				}
+				uint32_t component = 0;
+				uint32_t width = 1;
+				if (inst->GetOpcode() == ValueOpcode::CompositeExtractU32x2 ||
+				    inst->GetOpcode() == ValueOpcode::CompositeExtractU32x4) {
+					width = inst->GetOpcode() == ValueOpcode::CompositeExtractU32x2 ? 2u : 4u;
+					if (inst->NumArgs() != 2u || !ImmediateU32(inst->Arg(1), component) ||
+					    component >= width) return false;
+					inst = inst->Arg(0).Resolve().TryInstruction();
+				}
+				const auto opcode = width == 1u ? ValueOpcode::LoadBufferU32 :
+				    width == 2u ? ValueOpcode::LoadBufferU32x2 : ValueOpcode::LoadBufferU32x4;
+				if (inst == nullptr || inst->GetOpcode() != opcode || inst->NumArgs() != 5u ||
+				    !Implies(guard, inst->Arg(4))) return false;
+				const auto index = inst->Flags<MemoryFlags>().index;
+				if (index >= m_program.memory_info.size() || !MemoryIndexBelongsTo(index, *inst)) return false;
+				const auto& memory = m_program.memory_info[index];
+				uint32_t voffset, soffset;
+				DescriptorSource candidate;
+				if (memory.kind != ResourceKind::Buffer || !memory.idxen || memory.offen ||
+				    memory.typed || memory.data_bits != 32u || memory.data_dwords != width ||
+				    !ImmediateU32(inst->Arg(2), voffset) || voffset != 0u ||
+				    !ImmediateU32(inst->Arg(3), soffset) || soffset != 0u ||
+				    (memory.offset & 3u) != 0u || memory.offset > UINT32_MAX - component * 4u ||
+				    !MakeRuntimeTableSource(*inst, candidate)) return false;
+				const auto offset = memory.offset + (memory.formatted ? 0u : component * 4u);
+				const auto format_component = memory.formatted ? component : UINT32_MAX;
+				if (found_load) {
+					if (field != offset || field_mask != mask || formatted_component != format_component ||
+					    candidate.dword_count != material_source.dword_count) return false;
+					for (uint32_t word = 0; word < candidate.dword_count; ++word)
+						if (!EquivalentValue(m_program, candidate.dwords[word], material_source.dwords[word]))
+							return false;
+				} else {
+					material_source = candidate;
+					field = offset;
+					field_mask = mask;
+					formatted_component = format_component;
+					found_load = true;
+				}
+				return true;
+			};
+			const bool result = evaluate();
+			if (result) {
+				ProvenValue proof {value, mask, {}};
+				for (size_t i = requirement_start; i < requirements.size(); ++i)
+					if (std::ranges::find(proof.requirements, requirements[i]) == proof.requirements.end())
+						proof.requirements.push_back(requirements[i]);
+				proven.push_back(std::move(proof));
+			}
+			return result;
+		};
+		if (!trace(trace, first->Arg(0), 0x07ffffffu) || !found_load) return false;
+		indirect.material_source = InternSource(material_source);
+		indirect.indexed_material_keys = true;
+		indirect.material_key_mask = field_mask;
+		indirect.material_component = formatted_component;
+		indirect.selector_offset = field;
+		return true;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan, bool bounded_table = false) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -1446,6 +1643,7 @@ private:
 				       use.user->GetOpcode() != ValueOpcode::ImageGatherRaw;
 			})) return false;
 			indirect.bounded_buffer_table = true;
+			MatchIndexedMaterialKey(key, handle, indirect, material_source);
 		} else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&

@@ -479,6 +479,9 @@ struct DescriptorSource {
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
 		bool     bounded_buffer_table = false;
+		bool     indexed_material_keys = false;
+		uint32_t material_key_mask = UINT32_MAX;
+		uint32_t material_component = UINT32_MAX;
 		Value    key_count;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;
