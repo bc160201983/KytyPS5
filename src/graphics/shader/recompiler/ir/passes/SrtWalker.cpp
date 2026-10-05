@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -475,6 +476,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			std::fprintf(stderr, "SRT read failed: hash=0x%016" PRIx64 " pc=0x%08x address=0x%016" PRIx64 " dwords=1\n",
+			    m_program.shader_hash, flags.pc, address);
 			return false;
 		}
 	} else {
@@ -846,6 +849,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	result.dword_count = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+			std::fprintf(stderr, "SRT descriptor failed: hash=0x%016" PRIx64 " source=%u dword=%u\n",
+			    m_program.shader_hash, source, index);
 			return false;
 		}
 	}
@@ -862,7 +867,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+			std::fprintf(stderr, "SRT slot failed: hash=0x%016" PRIx64 " slot=%u flat_offset=%u clean=%u\n",
+			    m_program.shader_hash, slot, read.flat_offset, static_cast<unsigned>(clean));
+			return false;
+		}
+		return true;
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {

@@ -219,9 +219,14 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 	}
 	const auto address = base + offset;
 	const auto prefix = words.first(count);
-	return prefix.size_bytes() - 1u <= AddressMask - address &&
-	       runtime.read_specialization_memory != nullptr &&
-	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
+	if (prefix.size_bytes() - 1u > AddressMask - address ||
+	    runtime.read_specialization_memory == nullptr ||
+	    !runtime.read_specialization_memory(runtime.userdata, address, prefix)) {
+		return SpecializationFail(fmt::format(
+		    "table read failed: base=0x{:x} size=0x{:x} offset=0x{:x} address=0x{:x} dwords={}",
+		    base, size, offset, address, count));
+	}
+	return true;
 }
 
 bool MaterializeIndirectImage(const ResourcePlan& program,
@@ -238,10 +243,14 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		keys.clear();
 		DescriptorValue material_value;
 		DescriptorValue table_value;
-		if ((indirect.material_source != UINT32_MAX &&
-		     !clean.EvaluateDescriptor(indirect.material_source, material_value)) ||
-		    !clean.EvaluateDescriptor(indirect.table_source, table_value)) {
-			return false;
+		if (indirect.material_source != UINT32_MAX &&
+		    !clean.EvaluateDescriptor(indirect.material_source, material_value)) {
+			return SpecializationFail(fmt::format("image {} material source {} evaluation failed",
+			    image_index, indirect.material_source));
+		}
+		if (!clean.EvaluateDescriptor(indirect.table_source, table_value)) {
+			return SpecializationFail(fmt::format("image {} table source {} evaluation failed",
+			    image_index, indirect.table_source));
 		}
 		ShaderBufferResource table;
 		if (table_value.dword_count == 2u) {
@@ -254,7 +263,10 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		}
 		if (indirect.bounded_buffer_table) {
 			if (table_value.dword_count != 4u || indirect.material_source != UINT32_MAX ||
-			    indirect.table_offset != 0u || table_size > (uint64_t{1} << 32u)) return false;
+			    indirect.table_offset != 0u || table_size > (uint64_t{1} << 32u))
+				return SpecializationFail(fmt::format(
+				    "image {} invalid bounded table: width={} base=0x{:x} size=0x{:x}",
+				    image_index, table_value.dword_count, table_base, table_size));
 			// Include a partial final record: scalar-buffer reads zero its tail.
 			const auto count = (table_size + 31u) / 32u;
 			if (count > MaxIndirectImageProbes)
@@ -365,7 +377,9 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			ordinal = static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u);
 			if (found == snapshot.images.end()) {
 				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
-					return false;
+					return SpecializationFail(fmt::format(
+					    "image {} descriptor expansion exceeds {} images at key={} base=0x{:x} size=0x{:x}",
+					    image_index, ShaderInfo::MaxImages, key, table_base, table_size));
 				}
 				snapshot.images.push_back(candidate);
 				auto child = root_image;
@@ -959,9 +973,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	const auto fail = [&](std::string_view reason) {
+		return SpecializationFail(fmt::format("hash=0x{:016x} stage={} {}",
+		    program.shader_hash, static_cast<uint32_t>(program.stage), reason));
+	};
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
-		return false;
+		return fail("incomplete resource plan or missing specialization-memory callback");
 	}
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
@@ -977,7 +995,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
+		return fail("SRT flat-buffer refresh failed");
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
@@ -1009,7 +1027,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i],
 		              program.info.buffers[i].written)) {
-			return false;
+			return fail(fmt::format("buffer {} source {} pc=0x{:x} evaluation failed", i,
+			    program.info.buffers[i].source, program.info.buffers[i].first_use_pc));
 		}
 		auto&                descriptor_value = snapshot.buffers[i];
 		ShaderBufferResource descriptor;
@@ -1055,7 +1074,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
-			return false;
+			return fail(fmt::format("image {} has invalid source {}", i, image.source));
 		}
 		if (source->indirect_image.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
@@ -1064,11 +1083,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_image;
 			if (!MaterializeIndirectImage(program, indirect, i, observed, clean, snapshot, specialization)) {
-				return false;
+				return fail(fmt::format("indirect image {} source {} pc=0x{:x} materialization failed", i,
+				    image.source, image.first_use_pc));
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
-				return false;
+				return fail(fmt::format("image {} source {} pc=0x{:x} evaluation failed", i,
+				    image.source, image.first_use_pc));
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
@@ -1078,7 +1099,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
-			return false;
+			return fail(fmt::format("sampler {} source {} evaluation failed", i,
+			    program.info.samplers[i].source));
 		}
 		if (program.info.samplers[i].gather_lod) {
 			const auto control = snapshot.samplers[i].dwords[2];
