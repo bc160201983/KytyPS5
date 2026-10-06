@@ -7,12 +7,20 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 
 namespace GameContent {
 
 inline constexpr uint64_t MaxMetadataSize      = uint64_t {1} << 20u;
 inline constexpr uint64_t MaxImageSize         = uint64_t {32} << 20u;
 inline constexpr uint64_t MaxTrophyPackageSize = uint64_t {128} << 20u;
+
+struct ArchivePreview {
+    QByteArray metadata;
+    QByteArray icon;
+};
+// Cached launcher-only data. Game reads always use the live archive reader.
+[[nodiscard]] std::optional<ArchivePreview> ReadArchivePreview(const QString& base, bool refresh = false);
 
 [[nodiscard]] std::filesystem::path ToPath(const QString& path);
 [[nodiscard]] QString               FromPath(const std::filesystem::path& path);

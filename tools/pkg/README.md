@@ -48,6 +48,14 @@ on the next scan. The toolbar displays scan status and unavailable-archive count
 Hover over that count for troubleshooting. Sorting, search text, selection where
 possible, and the identity of running game rows are preserved.
 
+Archive titles and icons are cached in Qt's per-user cache directory after a
+successful scan. Later launcher starts can list unchanged archives without
+starting the PKG helper. Canonical path, file size and modification time identify
+the cached preview. Refresh bypasses this cache; changed packages are reread
+automatically. The first scan and an explicit Refresh still open each archive
+and can take time for large libraries. Game execution always opens the live
+archive and does not use the preview cache.
+
 ## Scope
 
 The implemented reader handles the plaintext/no-auth SDK debug profile: FIH v3,

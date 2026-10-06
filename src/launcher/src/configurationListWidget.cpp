@@ -52,6 +52,7 @@
 #include <QtCore>
 
 #include <memory>
+#include <utility>
 
 #include "ui_configuration_list_widget.h"
 
@@ -230,6 +231,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	connect(m_ui->refresh_action, &QAction::triggered, this, [this] {
 		if (m_scanning) return;
 		// Paint feedback before potentially expensive package catalog reads.
+		m_refresh_archives = true;
 		m_ui->refresh_action->setEnabled(false);
 		m_ui->scan_status->setText(tr("Scanning…"));
 		QTimer::singleShot(0, this, &ConfigurationListWidget::ScanGameDirectory);
@@ -586,8 +588,9 @@ void ConfigurationListWidget::ScanGameDirectory() {
 	QScopedValueRollback<bool> scanning(m_scanning, true);
 	m_ui->refresh_action->setEnabled(false);
 	m_ui->scan_status->setText(tr("Scanning…"));
-	// Existing open game files retain their reader; metadata is reopened for this scan.
+	// Existing game files retain their reader. Preview cache misses reopen metadata.
 	Common::InvalidateArchiveCache();
+	const bool refresh_archives = std::exchange(m_refresh_archives, false);
 	int unavailable_archives = 0;
 	// Commit an active inline editor before destroying its row or replacing its data.
 	if (auto* focused = QApplication::focusWidget();
@@ -616,29 +619,25 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		}
 	}
 
-	const QString eboot_name = QStringLiteral("eboot.bin");
 	QSet<QString> found_games;
-	const auto    add_game = [this, &found_games, &eboot_name, &running_items,
-                           &unavailable_archives](const QString& base, const QString& game_path,
+	const auto    add_game = [this, &found_games, &running_items,
+                           &unavailable_archives, refresh_archives](const QString& base, const QString& game_path,
                                                   const QString& legacy_game_path,
                                                   const QString& fallback, bool archive) {
         const QString game_key = PathKey(game_path);
         if (game_key.isEmpty() || found_games.contains(game_key)) {
             return;
         }
-        // Keep the index and decompression cache alive through validation, metadata and icon
-        // reads, after rejecting duplicate candidates from overlapping game folders.
-        const auto reader = archive ? Common::OpenArchive(GameContent::ToPath(base)) : nullptr;
-        if (archive && (reader == nullptr || !GameContent::FileExists(base, eboot_name))) {
+        const auto preview = archive ? GameContent::ReadArchivePreview(base, refresh_archives)
+                                     : std::optional<GameContent::ArchivePreview>{};
+        if (archive && !preview) {
             ++unavailable_archives;
             return;
         }
         found_games.insert(game_key);
 
-        const auto metadata =
-            GetGameMetadata(GameContent::ReadFile(base, QStringLiteral("sce_sys/param.json"),
-		                                             GameContent::MaxMetadataSize),
-		                       fallback);
+        const auto metadata = GetGameMetadata(archive ? preview->metadata :
+            GameContent::ReadFile(base, QStringLiteral("sce_sys/param.json"), GameContent::MaxMetadataSize), fallback);
         auto info = std::make_unique<Configuration>();
         info->custom_settings =
             FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;

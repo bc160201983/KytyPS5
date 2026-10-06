@@ -6,6 +6,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QStandardPaths>
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -15,6 +16,7 @@ void Check(bool value, const char* message) {
 }
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
+    QStandardPaths::setTestModeEnabled(true);
     Check(argc == 2, "pass a test directory containing fixture.staged");
     QDir root(QString::fromLocal8Bit(argv[1]));
     const auto staged = root.filePath("fixture.staged");
@@ -39,6 +41,26 @@ int main(int argc, char** argv) {
     Check(before->Read(boot->id, 0, bytes.size(), bytes.data()) == 4 && bytes[0] == 0x7f,
           "invalidating metadata broke an existing open reader");
     before.reset(); after.reset(); Common::InvalidateArchiveCache();
+    auto preview = GameContent::ReadArchivePreview(pkg, true);
+    Check(preview.has_value() && preview->metadata.contains("PPSA00001"), "preview metadata not read");
+    Common::InvalidateArchiveCache();
+    const auto helper = qgetenv("KYTY_PKG_HELPER");
+    const bool had_helper = qEnvironmentVariableIsSet("KYTY_PKG_HELPER");
+    qputenv("KYTY_PKG_HELPER", root.filePath("missing-helper.dll").toUtf8());
+    Check(GameContent::ReadArchivePreview(pkg).has_value(), "warm preview started the missing helper");
+    Check(!GameContent::ReadArchivePreview(pkg, true).has_value(), "forced refresh reused cached preview");
+    Check(!GameContent::ReadArchivePreview(pkg).has_value(), "failed refresh preserved stale cache");
+    if (had_helper) qputenv("KYTY_PKG_HELPER", helper); else qunsetenv("KYTY_PKG_HELPER");
+    Common::InvalidateArchiveCache();
+    Check(GameContent::ReadArchivePreview(pkg, true).has_value(), "preview retry failed");
+    Common::InvalidateArchiveCache();
+    qputenv("KYTY_PKG_HELPER", root.filePath("missing-helper.dll").toUtf8());
+    { QFile changed(pkg); Check(changed.open(QIODevice::Append), "open package for size change"); changed.write("x"); }
+    Check(!GameContent::ReadArchivePreview(pkg).has_value(), "changed package reused stale preview");
+    // Remove the old preview and restore the helper for the remaining discovery tests.
+    (void)GameContent::ReadArchivePreview(pkg, true);
+    if (had_helper) qputenv("KYTY_PKG_HELPER", helper); else qunsetenv("KYTY_PKG_HELPER");
+    Common::InvalidateArchiveCache();
     const auto fpkg = root.filePath("renamed.fpkg");
     Check(QFile::rename(pkg, fpkg), "rename package");
     games = DiscoverGames({root.absolutePath()});
@@ -49,5 +71,5 @@ int main(int argc, char** argv) {
     { QFile bootfile(root.filePath("nested/extracted/eboot.bin")); Check(bootfile.open(QIODevice::WriteOnly), "create eboot"); }
     games = DiscoverGames({root.absolutePath()});
     Check(games.size() == 1 && !games[0].archive, "extracted game regression");
-    std::cout << "Discovery tests passed: live add, incomplete-copy retry, duplicates, retained readers, rename, removal, extracted games\n";
+    std::cout << "Discovery tests passed: live add, incomplete-copy retry, duplicates, retained readers, preview cache, forced refresh, size invalidation, rename, removal, extracted games\n";
 }
