@@ -1379,6 +1379,31 @@ private:
 		return {};
 	}
 
+	// A scalar material table may store the image key inside a fixed-size
+	// record selected on the GPU. The buffer byte bound makes its keys finite.
+	bool MatchScalarMaterialKey(Value key, DescriptorSource::IndirectImage& indirect,
+	                            DescriptorSource& material_source) {
+		const auto* read = key.Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::ReadConstBuffer) return false;
+		uint32_t index = 0;
+		const auto* memory = ScalarReadMemory(*read, index);
+		if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+		    !MemoryIndexBelongsTo(index, *read) || (memory->offset & 3u) != 0u) return false;
+		const auto* offset = read->Arg(1).Resolve().TryInstruction();
+		uint32_t shift = 0;
+		if (offset == nullptr || offset->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    !ImmediateU32(offset->Arg(1), shift) || shift < 2u || shift > 16u) return false;
+		if (offset->Arg(0).Resolve().GetType() != Type::U32 ||
+		    memory->offset > (1u << shift) - 4u ||
+		    !MakeRuntimeTableSource(*read, material_source)) return false;
+		indirect.material_source = InternSource(material_source);
+		indirect.indexed_material_keys = true;
+		indirect.material_key_mask = 0x07ffffffu;
+		indirect.selector_stride = 1u << shift;
+		indirect.selector_offset = memory->offset;
+		return true;
+	}
+
 	bool MatchIndexedMaterialKey(Value key, const Inst& image, DescriptorSource::IndirectImage& indirect,
 	                             DescriptorSource& material_source) {
 		const auto* first = key.Resolve().TryInstruction();
@@ -1636,14 +1661,15 @@ private:
 			// an explicit byte bound for enumerating its 32-byte image records.
 			if (table_source.dword_count != 4u || table_offset != 0u) return false;
 			const auto* selector = key.Resolve().TryInstruction();
-			if (selector == nullptr || selector->GetOpcode() != ValueOpcode::ReadFirstLane ||
-			    selector->NumArgs() != 2u) return false;
+			const bool scalar_material = MatchScalarMaterialKey(key, indirect, material_source);
+			if (!scalar_material && (selector == nullptr || selector->GetOpcode() != ValueOpcode::ReadFirstLane ||
+			    selector->NumArgs() != 2u)) return false;
 			if (std::ranges::any_of(handle.Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::ImageSampleRaw &&
 				       use.user->GetOpcode() != ValueOpcode::ImageGatherRaw;
 			})) return false;
 			indirect.bounded_buffer_table = true;
-			MatchIndexedMaterialKey(key, handle, indirect, material_source);
+			if (!scalar_material) MatchIndexedMaterialKey(key, handle, indirect, material_source);
 		} else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&

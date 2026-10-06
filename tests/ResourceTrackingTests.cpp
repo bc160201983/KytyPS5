@@ -518,6 +518,93 @@ void CheckIndexedMaterialImageTable(bool guarded_load, bool formatted = false, b
         "oversized material descriptor was scanned without a byte bound");
 }
 
+void CheckScalarMaterialImageTable(uint32_t field) {
+  Fixture fixture;
+  const auto table = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                    fixture.UserData(2), fixture.UserData(3)});
+  const auto lane_key = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto material = fixture.Buffer({fixture.UserData(4), fixture.UserData(5),
+                                       fixture.UserData(6), fixture.UserData(7)});
+  MemoryInfo key_memory;
+  key_memory.kind = ResourceKind::ScalarBuffer;
+  key_memory.offset = field;
+  const auto row_offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {lane_key, Value(7u)});
+  const auto key = fixture.Emit(ValueOpcode::ReadConstBuffer, {material, row_offset},
+                                fixture.AddMemory(key_memory, 0x2300));
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  std::array<Value, 8> words;
+  for (uint32_t i = 0; i < 8; ++i) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.offset = i * 4;
+    words[i] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                           fixture.AddMemory(memory, 0x113c));
+  }
+  for (unsigned i = 0; i < 2; ++i) {
+    const auto image = fixture.Image(words, 0x114c + i * 8);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x114c + i * 8));
+  }
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+  Check(fixture.program.info.images.size() == 1, "shared image table was not interned");
+  std::array<uint32_t, 8> user_data{0x1000u, 0u, 128u * 32u, 0u, 0x3000u, 0u,
+                                     256u + field + 4u, 0u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t i = 0; i < 128; ++i) {
+    descriptor[0] = 0x20u + i * 0x20u;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + i * 8);
+  }
+  memory.words[(0x2000 + field) / 4] = 0x80000001u;
+  memory.words[(0x2080 + field) / 4] = 1u;
+  memory.words[(0x2100 + field) / 4] = 127u;
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "GPU-selected buffer table did not materialize");
+  Check(snapshot.images.size() == 4 && snapshot.images[0].dwords[0] == 0 &&
+        snapshot.images[1].dwords[0] == 0x20 && snapshot.images[2].dwords[0] == 0x40 &&
+        snapshot.images[3].dwords[0] == 0x1000,
+        "material key narrowing lost selected images or retained unused heap entries");
+  Check(plan.capture_specialization_reads && !snapshot.specialization_reads.empty(),
+        "material keys were not captured for specialization invalidation");
+  // A scalar byte read uses the explicit 128-byte record stride, even when
+  // the descriptor itself has a different nonzero stride.
+  const auto byte_size = user_data[6];
+  user_data[5] = 4u << 16u;
+  user_data[6] = byte_size / 4u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 4,
+        "scalar record stride was replaced by the descriptor stride");
+  user_data[5] = 0u;
+  user_data[6] = byte_size - 1u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 3,
+        "partial final scalar dword was not zero filled");
+  user_data[6] = byte_size;
+  memory.fail_address = 0x3100u + field;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable scalar material field was silently accepted");
+}
+
+void TestScalarMaterialImageTable() {
+  CheckScalarMaterialImageTable(64u);
+  CheckScalarMaterialImageTable(76u);
+}
+
 void TestIndexedMaterialImageTable() {
   CheckIndexedMaterialImageTable(true);
   CheckIndexedMaterialImageTable(false);
@@ -3703,6 +3790,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("GPU-selected shared image table", TestGpuSelectedSharedImageTable);
     Run("indexed material image table", TestIndexedMaterialImageTable);
+    Run("scalar material image table", TestScalarMaterialImageTable);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

@@ -280,9 +280,14 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 				    "GPU-selected image table has {} records; limit is {}", count, MaxIndirectImageProbes));
 			if (indirect.indexed_material_keys) {
 				ShaderBufferResource material;
-				if (!DecodeBufferDescriptor(material_value, material) || material.Stride() == 0u || (material.Stride() & 3u) != 0u ||
-				    (material.PackedStride() & (1u << 14u)) != 0u ||
-				    indirect.selector_offset + uint64_t{4} > material.Stride())
+				if (!DecodeBufferDescriptor(material_value, material))
+					return SpecializationFail("invalid material buffer descriptor");
+				const bool scalar_material = indirect.selector_stride != 0u;
+				const uint64_t stride = scalar_material ? indirect.selector_stride : material.Stride();
+				if (stride == 0u || (stride & 3u) != 0u ||
+				    (!scalar_material && material.SwizzleEnabled()) ||
+				    indirect.selector_offset + uint64_t{4} > stride ||
+				    (scalar_material && indirect.material_component != UINT32_MAX))
 					return SpecializationFail("unsupported indexed material buffer geometry");
 				uint64_t field_offset = indirect.selector_offset;
 				if (indirect.material_component != UINT32_MAX) {
@@ -302,7 +307,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 						return SpecializationFail("unsupported material key swizzle");
 					}
 				}
-				const auto records = material.NumRecords();
+				const uint64_t records = scalar_material ? (material.GetSize() + stride - 1u) / stride : material.NumRecords();
 				if (material.GetSize() > MaxMaterialScanBytes)
 					return SpecializationFail(fmt::format(
 					    "material scan exceeds {} bytes: base=0x{:x} records={} stride={} bytes={}",
@@ -311,18 +316,18 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 				keys.push_back(0u);
 				std::vector<uint8_t> seen(static_cast<size_t>(count), 0u);
 				if (!seen.empty()) seen[0] = 1u;
-				const uint64_t records_per_read = std::max<uint64_t>(1u, MaterialReadBytes / material.Stride());
+				const uint64_t records_per_read = std::max<uint64_t>(1u, MaterialReadBytes / stride);
 				std::vector<uint32_t> words;
 				for (uint64_t first = 0; first < records; first += records_per_read) {
 					const auto batch = std::min<uint64_t>(records - first, records_per_read);
 					// Read from the first selected field through the last, excluding
 					// the final record's unused tail and respecting descriptor bounds.
-					const auto bytes = (batch - 1u) * material.Stride() + sizeof(uint32_t);
+					const auto bytes = (batch - 1u) * stride + sizeof(uint32_t);
 					words.resize(static_cast<size_t>(bytes / sizeof(uint32_t)));
 					if (!ReadScalarTable(material.Base48(), material.GetSize(),
-					    first * material.Stride() + field_offset, runtime, words)) return false;
+					    first * stride + field_offset, runtime, words)) return false;
 					for (uint64_t record = 0; record < batch; ++record) {
-						const auto key = words[record * (material.Stride() / sizeof(uint32_t))] &
+						const auto key = words[record * (stride / sizeof(uint32_t))] &
 						    indirect.material_key_mask;
 						if (key < count && !seen[key]) {
 							seen[key] = 1u;
